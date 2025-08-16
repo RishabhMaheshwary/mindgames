@@ -10,22 +10,27 @@ from collections import defaultdict
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
-
+from agent import GPTAgent, GamePlayAgent 
 import textarena as ta
 
-NUM_EPISODES = 8
-EVAL_ENV_IDS = [("ThreePlayerIPD-v0", 3), ("ColonelBlotto-v0", 2)]  # (env-id, num_players)
+NUM_EPISODES = 5
+EVAL_ENV_IDS = [("Codenames-v0", 4),("ThreePlayerIPD-v0", 3), ("ColonelBlotto-v0", 2)]  # (env-id, num_players)
 OPPONENT_NAME = "google/gemini-2.0-flash-001"
 FILE_NAME = "eval_summary.csv"
 
 # Model to evaluate
-model = ta.agents.HFLocalAgent(
-    model_name="Qwen/Qwen3-4B",
-    max_new_tokens=512,
-)
+# model = ta.agents.HFLocalAgent(
+#     model_name="Qwen/Qwen3-4B",
+#     max_new_tokens=512,
+# )
+# model = GPTAgent(max_tokens=4096)
+# opponent = GPTMiniAgent1(max_tokens=4096)
+
+model = GPTMiniAgent()
+opponent = GPTAgent()
 
 # Fixed opponent
-opponent = ta.agents.OpenRouterAgent(model_name=OPPONENT_NAME)
+# opponent = ta.agents.OpenRouterAgent(model_name=OPPONENT_NAME)
 
 
 def run_game(env_id: str, num_players: int, model, opponent) -> dict:

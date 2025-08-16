@@ -1,9 +1,98 @@
 from abc import ABC, abstractmethod
+import os
+import time
+from openai import AzureOpenAI, OpenAI
+from simulation_utils1 import simulate_game_tree, evaluate_best_branch, evaluate_best_branch_old
+import random
+from dotenv import load_dotenv
+load_dotenv()
 
-STANDARD_GAME_PROMPT = "You are a competitive game player. Make sure you read the game instructions carefully, and always follow the required format."
+STANDARD_GAME_PROMPT = "You are a competitive game player. Make sure you read the game instructions carefully, and always follow the required format. Only output the action in the correct format without any additional text."
+
+class UnifiedAIClient:
+    def __init__(
+        self,
+        client_type="AzureOpenAI",
+        endpoint=None,
+        deployment=None,
+        api_key=None,
+        api_version=None,
+        max_tokens=4096,
+        temperature=0.5
+    ):
+        self.client_type = client_type
+        self.endpoint = endpoint or os.getenv("ENDPOINT_URL", "")
+        self.deployment = deployment or os.getenv("DEPLOYMENT_NAME", "gpt-4o")
+        self.api_key = api_key or os.getenv("AZURE_OPENAI_API_KEY", "")
+        self.api_version = os.getenv("AZURE_OPENAI_API_VERSION", "")
+        self.max_tokens = max_tokens
+        self.temperature = temperature
+
+        if self.client_type == "OpenAI":
+            self.client = OpenAI(
+                api_key=os.getenv("OPENAI_API_KEY", "")
+            )
+        elif self.client_type == "AzureOpenAI":
+            self.client = AzureOpenAI(
+                azure_endpoint=self.endpoint,
+                api_key=self.api_key,
+                api_version=self.api_version
+            )
+        elif self.client_type == "vllm":
+            self.client = OpenAI(
+                base_url=self.endpoint,
+                api_key=self.api_key
+            )
+        else:
+            raise ValueError("Unsupported client type")
+
+    def get_completion(
+        self,
+        messages,
+        max_tokens=None,
+        temperature=None,
+        max_retries=5,
+        initial_wait=1,
+    ):
+        max_tokens = max_tokens or self.max_tokens
+        temperature = temperature or self.temperature
+        no_think = ""
+        if self.client_type == "vllm":
+            no_think = " /no_think"
+        
+        messages[-1]["content"] = messages[-1]["content"] + no_think
+
+        for attempt in range(max_retries):
+            try:
+                response = self.client.chat.completions.create(
+                    model=self.deployment,
+                    messages=messages,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    top_p=0.95,
+                    frequency_penalty=0,
+                    presence_penalty=0,
+                )
+                return response.choices[0].message.content.strip()
+            except Exception as e:
+                if "rate limit" in str(e).lower() and attempt < max_retries - 1:
+                    wait_time = initial_wait * (2**attempt)  # Exponential backoff
+                    print(f"Rate limit exceeded. Waiting {wait_time} seconds...")
+                    time.sleep(wait_time)
+                    continue
+                elif "gateway time-out" in str(e).lower() and attempt < max_retries - 1:
+                    wait_time = initial_wait * (2**attempt)  # Exponential backoff
+                    print(f"Gateway timeout exceeded. Waiting {wait_time} seconds...")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    print(f"Error: {e}")
+                    return ''
+
 
 class Agent(ABC):
-    """ Generic agent class that defines the basic structure of an agent """
+    """Generic agent class that defines the basic structure of an agent"""
+
     @abstractmethod
     def __call__(self, observation: str) -> str:
         """
@@ -17,64 +106,166 @@ class Agent(ABC):
         """
         pass
 
-class LLMAgent(Agent):
-    def __init__(self, model_name: str, device: str = "auto", quantize: bool = False, max_new_tokens: int = 1024,
-                 hf_kwargs: dict = None,):
-        """
-        Initialize the Hugging Face local agent.
-        
-        Args:
-            model_name (str): The name of the model.
-            device (str): Device to use for model inference (default: "auto").
-            quantize (bool): Whether to load the model in 8-bit quantized format (default: False).
-        """
-        super().__init__()
-        
-        try:
-            from transformers import pipeline, AutoTokenizer, AutoModelForCausalLM
-        except ImportError:
-            raise ImportError("Transformers library is required. Install it with: pip install transformers")
-            
-        ## Initialize the Hugging Face model and tokenizer
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        if hf_kwargs is None:
-            hf_kwargs = {}
-        if quantize: self.model = AutoModelForCausalLM.from_pretrained(model_name, load_in_8bit=True, device_map=device, **hf_kwargs)
-        else: self.model = AutoModelForCausalLM.from_pretrained(model_name, device_map=device, **hf_kwargs)
-        self.system_prompt = STANDARD_GAME_PROMPT
-        self.pipeline = pipeline('text-generation', max_new_tokens=max_new_tokens, model=self.model, tokenizer=self.tokenizer) ## Initialize the Hugging Face pipeline
-    
-    def __call__(self, observation: str) -> str:
-        """
-        Process the observation using the Hugging Face model and return the action.
-        
-        Args:
-            observation (str): The input string to process.
-        
-        Returns:
-            str: The response generated by the model.
-        """
-        try: # Generate a response
-            response = self.pipeline(self.system_prompt+"\n"+observation, num_return_sequences=1, return_full_text=False)
-            action = response[0]['generated_text'].strip() # Extract and return the text output
-            return action
-        except Exception as e:
-            return f"An error occurred: {e}"
-
 class HumanAgent(Agent):
-    """ Human agent class that allows the user to input actions manually """
+    """Human agent class that allows the user to input actions manually"""
+
     def __init__(self):
         super().__init__()
 
     def __call__(self, observation: str) -> str:
         """
         Process the observation and return the action.
-        
+
         Args:
             observation (str): The input string to process.
-            
+
         Returns:
             str: The response generated by the agent.
         """
-        print("\n\n+++ +++ +++") # for easies visualization of what is part of each turns observation
+        print(
+            "\n\n+++ +++ +++"
+        )  # for easies visualization of what is part of each turns observation
         return input(f"Current observations: {observation}\nPlease enter the action: ")
+
+
+class GamePlayAgent(Agent):
+    """GPT agent class that uses OpenAI's API to generate responses"""
+
+    def __init__(
+        self, system_prompt=None, max_tokens=4096, temperature=0.7, max_depth=1, game="Colonel Blotto"
+    ):
+        super().__init__()
+        self.system_prompt = system_prompt if system_prompt else STANDARD_GAME_PROMPT
+        self.max_tokens = max_tokens
+        self.temperature = temperature
+        self.pairs = {}
+        self.game = game
+        self.k_per_node = 5
+        self.max_depth = max_depth  # depth of simulation
+        self.openai_client = UnifiedAIClient(client_type="AzureOpenAI", deployment="gpt-4o-mini")
+
+    def __call__(self, observation: str) -> str:
+        """
+        Given the current game state `observation`, simulate possible futures,
+        evaluate the outcomes, and return the best next action.
+        """
+            # Step 1: Simulate possible futures from this game state
+            
+
+        if "codenames" in observation.lower():
+            self.game = "codenames"
+            role = "agent"
+            self.max_depth = 2
+        elif "colonel blotto" in observation.lower():
+            self.game = "colonel blotto"
+            role = "opponent"
+            self.max_depth = 2
+            self.k_per_node = 10
+        elif "3-player iterated prisoner's dilemma" in observation.lower():
+            self.game = "3-player iterated prisoner's dilemma"
+            role = "opponent"
+            self.max_depth = 2
+            
+        paired_branches = []
+
+        branches = simulate_game_tree(
+            model=self.openai_client,
+            game_state=observation,
+            prior_actions=[],
+            current_role=role,
+            depth=0,
+            max_depth=self.max_depth,
+            game=self.game,
+            k_per_node=self.k_per_node,
+            debug=False,          # <— turn on ToT logs
+            debug_max_chars=180, # optional truncation width``
+        )
+
+        # Step 2: Perform crossover on branches
+        k = 50  # Number of new branches to create
+        new_branches = []
+        branch_length = self.max_depth  # Each branch has 3 moves
+        
+        print("[Before crossover]")
+        for idx, branch in enumerate(branches, start=1):
+            print(f"  Branch {idx}: {branch}")
+            
+        for _ in range(k):
+            # Randomly select two branches to crossover
+            branch1 = random.choice(branches)
+            branch2 = random.choice(branches)
+            
+            # Create new branch by randomly selecting moves from either parent
+            new_branch = []
+            for i in range(branch_length):
+                # Randomly choose move from either branch1 or branch2
+                if random.random() < 0.5:
+                    new_branch.append(branch1[i])
+                else:
+                    new_branch.append(branch2[i])
+            
+            new_branches.append(new_branch)
+            
+        # Combine original and new branches
+        all_branches = [list(x) for x in set(tuple(branch) for branch in branches + new_branches)]
+        
+        all_branches = all_branches[:250]
+        
+        print("[After crossover]")
+        for idx, branch in enumerate(all_branches, start=1):
+            print(f"  Branch {idx}: {branch}")
+
+        # Step 3: Evaluate branches and pick the best one
+        best_action = evaluate_best_branch_old(
+            self.openai_client, observation, all_branches,
+            debug=True,          # <— turn on evaluator logs
+            debug_max_chars=220,
+            role=role
+        )
+        print(f"Best action: {best_action}")
+        return best_action
+
+class GPTAgent(Agent):
+    """GPT agent class that uses OpenAI's API to generate responses"""
+
+    def __init__(self, system_prompt=None, max_tokens=4096, temperature=0.7):
+        """
+        Initialize the GPT agent.
+
+        Args:
+            system_prompt (str, optional): Custom system prompt. Defaults to STANDARD_GAME_PROMPT.
+            max_tokens (int, optional): Maximum number of tokens for response. Defaults to 800.
+            temperature (float, optional): Temperature for response generation. Defaults to 0.7.
+        """
+        super().__init__()
+        self.client = UnifiedAIClient()
+        self.system_prompt = system_prompt if system_prompt else STANDARD_GAME_PROMPT
+        self.max_tokens = max_tokens
+        self.temperature = temperature
+
+    def __call__(self, observation: str) -> str:
+        """
+        Process the observation using the GPT model and return the action.
+
+        Args:
+            observation (str): The input string to process.
+
+        Returns:
+            str: The response generated by the model.
+        """
+        try:
+            messages = [
+                {"role": "system", "content": self.system_prompt},
+                {"role": "user", "content": observation},
+            ]
+
+            response = self.client.get_completion(
+                messages=messages,
+                max_tokens=self.max_tokens,
+                temperature=self.temperature,
+            )
+
+            # Extract and return the text output
+            return response
+        except Exception as e:
+            return f"An error occurred: {e}"
